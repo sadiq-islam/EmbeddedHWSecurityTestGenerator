@@ -1,109 +1,59 @@
-"""Read PDF text without deleting technical symbols; render images only when needed."""
+"""Parse PDF structure dynamically using Docling's AI Layout Analysis and RapidOCR."""
 
-from dataclasses import dataclass
-import re
+from io import BytesIO
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
+from docling.datamodel.base_models import InputFormat, DocumentStream
+from docling.chunking import HierarchicalChunker
 import pymupdf
-
-
-@dataclass
-class TextChunk:
-    # Structure representing a token-bounded portion of PDF text
-    content: str
-    page_number: int
-    chunk_index: int
-    char_start: int
-    char_end: int
-    source_kind: str = "text"
-
-
-def normalize(text: str) -> str:
-    """Ignore whitespace differences only when checking a literal source quote."""
-    # Replaces multiple whitespaces/newlines with a single space and trims ends
-    return re.sub(r"\s+", " ", text).strip()
-
 
 class PDFProcessor:
     def __init__(self, pdf_bytes: bytes, max_pages: int = 100):
-        # Load the PDF file from binary data
-        self.pdf = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        self.pdf_bytes = pdf_bytes
+        self.max_pages = max_pages
 
-        # Check for encrypted files or empty documents
-        if self.pdf.needs_pass or not self.pdf.page_count:
-            self.pdf.close()
-            raise ValueError("Upload an unlocked PDF with at least one page")
+        # Configure Docling for maximum universal robustness
+        pipeline_options = PdfPipelineOptions()
 
-        # Enforce page limits to prevent out-of-memory or high token costs
-        if self.pdf.page_count > max_pages:
-            count = self.pdf.page_count
-            self.pdf.close()
-            raise ValueError(f"PDF has {count} pages; increase the page limit ({max_pages})")
+        # 1. Enable OCR for any scanned documents or text trapped in images
+        pipeline_options.do_ocr = True
+        pipeline_options.ocr_options = RapidOcrOptions()
 
-    # Context manager implementation for standard 'with' block usage
+        # 2. Enable AI Table Structure Recognition (TSR) to handle complex grids
+        pipeline_options.do_table_structure = True
+
+        # 3. Enable AI Layout Analysis to dynamically determine reading order
+        # This automatically handles multi-column documents and 2-up booklets
+        # without needing manual slicing or aspect-ratio heuristics.
+        pipeline_options.generate_page_images = True
+
+        self.converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
+        )
+
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
-        self.pdf.close()
+        pass
 
-    @staticmethod
-    def clean_text(text: str) -> str:
-        # Preserve newlines, Unicode, signs, units, brackets and numeric boundaries.
-        # This collapses horizontal spaces but keeps structural newlines intact.
-        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
-        return "\n".join(lines).strip()
+    def extract_document(self):
+        """Converts the PDF to a structured DoclingDocument and creates semantic chunks."""
+        # Enforce page limits to prevent API/memory overload
+        with pymupdf.open(stream=self.pdf_bytes, filetype="pdf") as temp_pdf:
+            total_pages = temp_pdf.page_count
+            if total_pages > self.max_pages:
+                raise ValueError(f"PDF has {total_pages} pages; increase the page limit ({self.max_pages})")
 
-    def page(self, index: int, include_image: bool) -> dict:
-        # Load a specific page index
-        page = self.pdf.load_page(index)
-        # Extract text while attempting to preserve reading order (sort=True)
-        text = self.clean_text(page.get_text("text", sort=True))
+        # Pass the raw PDF stream to the AI parser
+        buf = BytesIO(self.pdf_bytes)
+        stream = DocumentStream(name="uploaded_spec.pdf", stream=buf)
+        result = self.converter.convert(stream)
 
-        # Limit text size to prevent LLM context window overflows during extraction
-        if len(text) > 24000:
-            raise ValueError(f"Page {index + 1} exceeds the 24,000-character extraction limit")
+        # Group text semantically based on detected headers rather than fixed token limits
+        chunker = HierarchicalChunker()
+        doc_chunks = list(chunker.chunk(result.document))
 
-        jpeg = None
-        if include_image:
-            # Render one bounded image at a time to keep laptop memory modest.
-            # Calculates a scaling matrix to ensure max dimension is around 1600px.
-            scale = min(1.5, 1600 / max(page.rect.width, page.rect.height))
-            jpeg = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale),
-                                   colorspace=pymupdf.csRGB, alpha=False).tobytes("jpeg")
-        return {"number": index + 1, "text": text, "jpeg": jpeg}
-
-
-def create_chunks(text: str, page: int, tokenizer, token_budget: int,
-                  source_kind: str = "text", overlap: int = 32) -> list[TextChunk]:
-    """Use tokenizer offsets so long sentences cannot overflow the embedding window."""
-    if not 0 <= overlap < token_budget:
-        raise ValueError("overlap must be smaller than token_budget")
-    if not text.strip():
-        return []
-
-    # Get word/character offsets for every token in the text
-    offsets = tokenizer(text, add_special_tokens=False, truncation=False,
-                        return_offsets_mapping=True)["offset_mapping"]
-    chunks = []
-    start = 0
-
-    # Slide a token window across the text
-    while start < len(offsets):
-        end = min(start + token_budget, len(offsets))
-        # Map the token window back to character indices in the original text
-        char_start, char_end = offsets[start][0], offsets[end - 1][1]
-        piece = text[char_start:char_end]
-
-        # Retokenizing a substring can introduce boundary tokens; shrink if needed.
-        while len(tokenizer.encode(piece, add_special_tokens=False)) > token_budget:
-            end -= 1
-            if end <= start:
-                raise ValueError("Could not create a bounded text chunk")
-            char_end = offsets[end - 1][1]
-            piece = text[char_start:char_end]
-
-        chunks.append(TextChunk(piece, page, len(chunks), char_start, char_end, source_kind))
-        if end == len(offsets):
-            break
-        # Shift the start window up, minus the overlap amount
-        start = max(start + 1, end - overlap)
-    return chunks
+        return result.document, doc_chunks, total_pages
